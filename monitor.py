@@ -14,21 +14,22 @@ import urllib.parse
 import urllib.request
 
 # ── Configuration ────────────────────────────────────────────────────────────
-BASE_URL     = "https://toyzzshop.bg/katalog/f/b/pokemon?product_list_order=created_at"
+BASE_URL         = "https://toyzzshop.bg/katalog/f/b/pokemon?product_list_order=created_at"
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-STATE_FILE   = "state/products.json"
-MAX_PAGES    = 20
+STATE_FILE       = "state/products.json"
+MAX_PAGES        = 20
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def page_url(n: int) -> str:
-    """Return the URL for page n (1-based). Page 1 has no &p= param."""
+    """Return the URL for page n (1-based).
+    Page 1: .../pokemon?product_list_order=created_at
+    Page 2: .../pokemon?product_list_order=created_at&p=2
+    """
     if n == 1:
         return BASE_URL
-    # Append page param cleanly regardless of existing query string
-    sep = "&" if "?" in BASE_URL else "?"
-    return f"{BASE_URL}{sep}p={n}"
+    return f"{BASE_URL}&p={n}"
 
 
 def fetch(url: str, retries: int = 3) -> str:
@@ -55,43 +56,55 @@ def fetch(url: str, retries: int = 3) -> str:
 def parse_products(html: str) -> dict[str, str]:
     """
     Extract product {url: name} pairs from raw HTML.
-    Product links look like:
-      <a href="https://toyzzshop.bg/some-slug" ...>Product Name</a>
-    We identify them by being single-path-segment toyzzshop.bg URLs
-    that appear inside a product-list container.
+
+    Each product card looks like:
+      <div class="product-item freegifts-XXXXXX">
+        <a href="https://toyzzshop.bg/some-product-slug" ...>
+          ...
+          <h2 class="product-item-name" ...>Product Name</h2>
+          ...
+        </a>
+      </div>
+
+    Strategy:
+      1. Split on product-item divs.
+      2. Inside each block, grab the first href pointing to a single-slug URL.
+      3. Grab the text content of the h2.product-item-name inside the same block.
     """
     products = {}
 
-    # Match all anchor tags that point to a single-slug toyzzshop.bg product page
-    pattern = re.compile(
-        r'<a\b[^>]*\bhref="(https://toyzzshop\.bg/[A-Za-z0-9\-]+)"[^>]*>'
-        r'(.*?)</a>',
-        re.DOTALL | re.IGNORECASE,
-    )
+    # Split on the opening of each product-item div
+    blocks = re.split(r'<div class="product-item\b', html)
 
-    for m in pattern.finditer(html):
-        href = m.group(1).strip()
-        inner = m.group(2).strip()
+    for block in blocks[1:]:   # skip everything before the first product
+        # 1. Extract the product URL — first toyzzshop.bg href in the block
+        href_m = re.search(
+            r'href="(https://toyzzshop\.bg/([A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9]))"',
+            block,
+        )
+        if not href_m:
+            continue
+        href = href_m.group(1)
+        path = href_m.group(2)
 
-        # Must be exactly one path segment (no extra slashes)
-        path = urllib.parse.urlparse(href).path.strip("/")
-        if "/" in path or not path:
+        # Must be a single path segment (no slashes in the slug)
+        if "/" in path:
             continue
 
-        # Skip obvious non-product pages
-        if path in {"katalog", "kontakti", "dostavka", "plashtane"}:
+        # 2. Extract the product name from <h2 class="product-item-name"...>...</h2>
+        name_m = re.search(
+            r'<h2[^>]*class="product-item-name"[^>]*>(.*?)</h2>',
+            block,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if not name_m:
             continue
 
-        # Strip HTML tags from inner text to get the name
-        name = re.sub(r"<[^>]+>", " ", inner)
+        # Strip all HTML tags and collapse whitespace to get plain text name
+        name = re.sub(r"<[^>]+>", " ", name_m.group(1))
         name = re.sub(r"\s+", " ", name).strip()
 
-        # Drop entries that look like navigation / UI chrome (too short or contain БГН/лв)
-        if len(name) < 4:
-            continue
-
-        # Keep only the first occurrence (anchors repeat for image + text)
-        if href not in products and name:
+        if name and href not in products:
             products[href] = name
 
     return products
@@ -100,7 +113,7 @@ def parse_products(html: str) -> dict[str, str]:
 def has_next_page(html: str, current_page: int) -> bool:
     """Return True if the HTML contains a link to the next page number."""
     next_p = current_page + 1
-    return f"p={next_p}" in html or f"?p={next_p}" in html
+    return bool(re.search(rf'[?&]p={next_p}\b', html))
 
 
 def scrape_all() -> dict[str, str]:
@@ -112,7 +125,7 @@ def scrape_all() -> dict[str, str]:
         html = fetch(url)
 
         page_products = parse_products(html)
-        print(f"    → {len(page_products)} products found on page {page_num}")
+        print(f"    -> {len(page_products)} products found on page {page_num}")
         all_products.update(page_products)
 
         if not has_next_page(html, page_num):
